@@ -1,4 +1,4 @@
-"""8 optimizasyon algoritması v2 — continuous rotation + adaptive sigma."""
+"""8 optimizasyon algoritması v2 — continuous rotation + adaptive sigma + batch fitness."""
 import numpy as np
 from copy import deepcopy
 import time
@@ -62,18 +62,38 @@ def crossover_rotation(r1: list, r2: list) -> list:
     return result
 
 
+def _batch_eval(population, fitness_fn, batch_fitness_fn):
+    """Popülasyonu batch veya sıralı evaluate et.
+
+    Args:
+        population: list of (seq, rots) tuples
+        fitness_fn: single evaluation fn(seq, rots) -> float
+        batch_fitness_fn: batch evaluation fn(list_of_seqs, list_of_rots) -> list_of_floats
+
+    Returns:
+        list of fitness values
+    """
+    if batch_fitness_fn is not None:
+        seqs = [ind[0] for ind in population]
+        rots = [ind[1] for ind in population]
+        return list(batch_fitness_fn(seqs, rots))
+    else:
+        return [fitness_fn(*ind) for ind in population]
+
+
 # ============================================================
 # 1. SPARROW SEARCH ALGORITHM (SSA)
 # ============================================================
 
 def sparrow_search(fitness_fn, n_pieces: int, pop_size: int = 50,
-                   max_iter: int = 5000, verbose: bool = False) -> dict:
+                   max_iter: int = 5000, verbose: bool = False,
+                   batch_fitness_fn=None) -> dict:
     PD = 0.2
     SD = 0.1
     n_disc = max(1, int(pop_size * PD))
 
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
     best_idx = np.argmax(fits)
     best_sol = deepcopy(pop[best_idx])
@@ -91,7 +111,8 @@ def sparrow_search(fitness_fn, n_pieces: int, pop_size: int = 50,
 
         sorted_idx = np.argsort(fits)[::-1]
 
-        # Discoverer'lar
+        # --- Discoverer'lar: üret, topla, batch evaluate ---
+        disc_candidates = []  # (pop_idx, new_seq, new_rots)
         for i in range(n_disc):
             idx = sorted_idx[i]
             seq, rots = pop[idx]
@@ -101,13 +122,19 @@ def sparrow_search(fitness_fn, n_pieces: int, pop_size: int = 50,
             else:
                 new_seq = mutate_sequence(seq, strength=1)
                 new_rots = mutate_rotation(rots, strength=1, sigma=expl_sigma)
-            new_fit = fitness_fn(new_seq, new_rots)
-            if new_fit > fits[idx]:
-                pop[idx] = (new_seq, new_rots)
-                fits[idx] = new_fit
+            disc_candidates.append((idx, new_seq, new_rots))
 
-        # Scrounger'lar
+        disc_pop = [(c[1], c[2]) for c in disc_candidates]
+        disc_fits = _batch_eval(disc_pop, fitness_fn, batch_fitness_fn)
+
+        for k, (idx, new_seq, new_rots) in enumerate(disc_candidates):
+            if disc_fits[k] > fits[idx]:
+                pop[idx] = (new_seq, new_rots)
+                fits[idx] = disc_fits[k]
+
+        # --- Scrounger'lar: üret, topla, batch evaluate ---
         worst_idx = sorted_idx[-1]
+        scr_candidates = []
         for i in range(n_disc, pop_size):
             idx = sorted_idx[i]
             seq, rots = pop[idx]
@@ -117,18 +144,31 @@ def sparrow_search(fitness_fn, n_pieces: int, pop_size: int = 50,
             else:
                 new_seq = mutate_sequence(seq, strength=3)
                 new_rots = mutate_rotation(rots, strength=3, sigma=disc_sigma)
-            new_fit = fitness_fn(new_seq, new_rots)
-            if new_fit > fits[idx]:
-                pop[idx] = (new_seq, new_rots)
-                fits[idx] = new_fit
+            scr_candidates.append((idx, new_seq, new_rots))
 
-        # Scout
+        scr_pop = [(c[1], c[2]) for c in scr_candidates]
+        scr_fits = _batch_eval(scr_pop, fitness_fn, batch_fitness_fn)
+
+        for k, (idx, new_seq, new_rots) in enumerate(scr_candidates):
+            if scr_fits[k] > fits[idx]:
+                pop[idx] = (new_seq, new_rots)
+                fits[idx] = scr_fits[k]
+
+        # --- Scout: üret, topla, batch evaluate ---
         n_scout = max(1, int(pop_size * SD))
         worst_indices = sorted_idx[-n_scout:]
+        scout_candidates = []
         for idx in worst_indices:
             if np.random.random() < 0.5:
-                pop[idx] = random_solution(n_pieces)
-                fits[idx] = fitness_fn(*pop[idx])
+                new_sol = random_solution(n_pieces)
+                scout_candidates.append((idx, new_sol))
+
+        if scout_candidates:
+            scout_pop = [c[1] for c in scout_candidates]
+            scout_fits = _batch_eval(scout_pop, fitness_fn, batch_fitness_fn)
+            for k, (idx, new_sol) in enumerate(scout_candidates):
+                pop[idx] = new_sol
+                fits[idx] = scout_fits[k]
 
         cur_best = np.argmax(fits)
         if fits[cur_best] > best_fit:
@@ -148,9 +188,10 @@ def sparrow_search(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 
 def genetic_algorithm(fitness_fn, n_pieces: int, pop_size: int = 50,
-                      max_iter: int = 5000, verbose: bool = False) -> dict:
+                      max_iter: int = 5000, verbose: bool = False,
+                      batch_fitness_fn=None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
     best_idx = np.argmax(fits)
     best_sol = deepcopy(pop[best_idx])
@@ -162,9 +203,10 @@ def genetic_algorithm(fitness_fn, n_pieces: int, pop_size: int = 50,
         progress = it / max_iter
         sigma = 30.0 * (1 - progress) + 2.0  # 32° → 2°
 
+        # Elitizm: en iyiyi koru
         new_pop = [deepcopy(best_sol)]
-        new_fits = [best_fit]
 
+        # Tüm çocukları üret (fitness hesaplamadan)
         while len(new_pop) < pop_size:
             t1, t2 = np.random.choice(pop_size, 2, replace=False)
             p1 = pop[t1] if fits[t1] > fits[t2] else pop[t2]
@@ -180,10 +222,13 @@ def genetic_algorithm(fitness_fn, n_pieces: int, pop_size: int = 50,
                 child_rots = mutate_rotation(child_rots, sigma=sigma)
 
             new_pop.append((child_seq, child_rots))
-            new_fits.append(fitness_fn(child_seq, child_rots))
 
-        pop = new_pop[:pop_size]
-        fits = new_fits[:pop_size]
+        new_pop = new_pop[:pop_size]
+        # Batch evaluate: elite (index 0) dahil tüm popülasyonu değerlendir
+        new_fits = _batch_eval(new_pop, fitness_fn, batch_fitness_fn)
+
+        pop = new_pop
+        fits = new_fits
 
         cur_best = np.argmax(fits)
         if fits[cur_best] > best_fit:
@@ -203,9 +248,10 @@ def genetic_algorithm(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 
 def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
-                 max_iter: int = 5000, sa_iters: int = 50, verbose: bool = False) -> dict:
+                 max_iter: int = 5000, sa_iters: int = 50, verbose: bool = False,
+                 batch_fitness_fn=None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
     best_idx = np.argmax(fits)
     best_sol = deepcopy(pop[best_idx])
@@ -219,7 +265,6 @@ def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
 
         # --- GA adımı ---
         new_pop = [deepcopy(best_sol)]
-        new_fits = [best_fit]
 
         while len(new_pop) < pop_size:
             t1, t2 = np.random.choice(pop_size, 2, replace=False)
@@ -236,12 +281,15 @@ def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
                 child_rots = mutate_rotation(child_rots, sigma=ga_sigma)
 
             new_pop.append((child_seq, child_rots))
-            new_fits.append(fitness_fn(child_seq, child_rots))
 
-        pop = new_pop[:pop_size]
-        fits = new_fits[:pop_size]
+        new_pop = new_pop[:pop_size]
+        new_fits = _batch_eval(new_pop, fitness_fn, batch_fitness_fn)
+
+        pop = new_pop
+        fits = new_fits
 
         # --- SA adımı (her 50 iterasyonda en iyiye lokal arama) ---
+        # SA tek çözüm üzerinde çalışır — batch gereksiz, sıralı fitness kullan
         if it % 50 == 0 and it > 0:
             cur_seq, cur_rots = deepcopy(best_sol)
             cur_fit = best_fit
@@ -283,6 +331,7 @@ def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 # 4. SIMULATED ANNEALING (SA)
 # ============================================================
+# Tek çözüm — batch fitness desteği yok, gereksiz.
 
 def simulated_annealing(fitness_fn, n_pieces: int, max_iter: int = 250000,
                         verbose: bool = False) -> dict:
@@ -327,9 +376,10 @@ def simulated_annealing(fitness_fn, n_pieces: int, max_iter: int = 250000,
 # ============================================================
 
 def differential_evolution(fitness_fn, n_pieces: int, pop_size: int = 50,
-                           max_iter: int = 5000, verbose: bool = False) -> dict:
+                           max_iter: int = 5000, verbose: bool = False,
+                           batch_fitness_fn=None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
     best_idx = np.argmax(fits)
     best_sol = deepcopy(pop[best_idx])
@@ -342,6 +392,8 @@ def differential_evolution(fitness_fn, n_pieces: int, pop_size: int = 50,
     sigma = 20.0  # DE: sabit sigma
 
     for it in range(max_iter):
+        # Tüm trial vektörlerini üret, sonra batch evaluate
+        trials = []
         for i in range(pop_size):
             candidates = list(range(pop_size))
             candidates.remove(i)
@@ -362,10 +414,14 @@ def differential_evolution(fitness_fn, n_pieces: int, pop_size: int = 50,
                     diff = ((rots_b[j] - rots_c[j] + 180) % 360) - 180
                     trial_rots[j] = (rots_a[j] + F * diff) % 360
 
-            trial_fit = fitness_fn(trial_seq, trial_rots)
-            if trial_fit > fits[i]:
-                pop[i] = (trial_seq, trial_rots)
-                fits[i] = trial_fit
+            trials.append((trial_seq, trial_rots))
+
+        trial_fits = _batch_eval(trials, fitness_fn, batch_fitness_fn)
+
+        for i in range(pop_size):
+            if trial_fits[i] > fits[i]:
+                pop[i] = trials[i]
+                fits[i] = trial_fits[i]
 
         cur_best = np.argmax(fits)
         if fits[cur_best] > best_fit:
@@ -385,9 +441,10 @@ def differential_evolution(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 
 def particle_swarm(fitness_fn, n_pieces: int, pop_size: int = 50,
-                   max_iter: int = 5000, verbose: bool = False) -> dict:
+                   max_iter: int = 5000, verbose: bool = False,
+                   batch_fitness_fn=None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
     pbest = deepcopy(pop)
     pbest_fits = fits.copy()
 
@@ -401,6 +458,7 @@ def particle_swarm(fitness_fn, n_pieces: int, pop_size: int = 50,
         w = 0.9 - 0.5 * (it / max_iter)
         sigma = 30.0 * w  # 27° → 12°
 
+        # Tüm partikülleri güncelle (fitness hesaplamadan)
         for i in range(pop_size):
             seq, rots = pop[i]
 
@@ -416,13 +474,15 @@ def particle_swarm(fitness_fn, n_pieces: int, pop_size: int = 50,
                 seq = mutate_sequence(seq)
                 rots = mutate_rotation(rots, sigma=sigma)
 
-            new_fit = fitness_fn(seq, rots)
             pop[i] = (seq, rots)
-            fits[i] = new_fit
 
-            if new_fit > pbest_fits[i]:
+        # Batch evaluate tüm partiküller
+        fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
+
+        for i in range(pop_size):
+            if fits[i] > pbest_fits[i]:
                 pbest[i] = deepcopy(pop[i])
-                pbest_fits[i] = new_fit
+                pbest_fits[i] = fits[i]
 
         cur_best = np.argmax(fits)
         if fits[cur_best] > gbest_fit:
@@ -442,9 +502,10 @@ def particle_swarm(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 
 def grey_wolf(fitness_fn, n_pieces: int, pop_size: int = 50,
-              max_iter: int = 5000, verbose: bool = False) -> dict:
+              max_iter: int = 5000, verbose: bool = False,
+              batch_fitness_fn=None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
-    fits = [fitness_fn(*ind) for ind in pop]
+    fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
     sorted_idx = np.argsort(fits)[::-1]
     alpha = deepcopy(pop[sorted_idx[0]])
@@ -458,6 +519,8 @@ def grey_wolf(fitness_fn, n_pieces: int, pop_size: int = 50,
         a = 2 - 2 * (it / max_iter)
         sigma = 30.0 * a / 2  # 30° → 0.1°
 
+        # Tüm kurtları güncelle (fitness hesaplamadan)
+        new_pop = []
         for i in range(pop_size):
             seq, rots = pop[i]
             leaders = [alpha, beta, delta]
@@ -473,10 +536,16 @@ def grey_wolf(fitness_fn, n_pieces: int, pop_size: int = 50,
                     new_seq = mutate_sequence(new_seq)
                     new_rots = mutate_rotation(new_rots, sigma=max(2.0, sigma))
 
-            new_fit = fitness_fn(new_seq, new_rots)
-            if new_fit > fits[i]:
-                pop[i] = (new_seq, new_rots)
-                fits[i] = new_fit
+            new_pop.append((new_seq, new_rots))
+
+        # Batch evaluate tüm kurtlar
+        new_fits = _batch_eval(new_pop, fitness_fn, batch_fitness_fn)
+
+        # Greedy selection: yeni birey daha iyiyse kabul et
+        for i in range(pop_size):
+            if new_fits[i] > fits[i]:
+                pop[i] = new_pop[i]
+                fits[i] = new_fits[i]
 
         sorted_idx = np.argsort(fits)[::-1]
         if fits[sorted_idx[0]] > alpha_fit:
@@ -496,6 +565,7 @@ def grey_wolf(fitness_fn, n_pieces: int, pop_size: int = 50,
 # ============================================================
 # 8. TABU SEARCH
 # ============================================================
+# Tek çözüm + 5 komşu/iter — batch fitness desteği yok, gereksiz.
 
 def tabu_search(fitness_fn, n_pieces: int, max_iter: int = 250000,
                 tabu_size: int = 200, verbose: bool = False) -> dict:
