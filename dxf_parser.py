@@ -10,9 +10,11 @@ def parse_dxf_raw(filepath: str) -> list[dict]:
         lines = f.read().splitlines()
 
     pieces = []
+    grain_lines = []
     i = 0
     in_block = False
     in_poly = False
+    poly_layer = ""
     vertices = []
     block_idx = -1
 
@@ -27,11 +29,15 @@ def parse_dxf_raw(filepath: str) -> list[dict]:
 
         if code == "0" and value in ("POLYLINE", "LWPOLYLINE"):
             in_poly = True
+            poly_layer = ""
             vertices = []
+
+        # Layer kodu (group code 8)
+        if in_poly and code == "8" and not poly_layer:
+            poly_layer = value
 
         if in_poly and code == "10":
             x = float(value)
-            # look for Y (code 20)
             j = i + 2
             while j < len(lines) - 1:
                 if lines[j].strip() == "20":
@@ -42,12 +48,24 @@ def parse_dxf_raw(filepath: str) -> list[dict]:
 
         if code == "0" and value == "SEQEND":
             if len(vertices) > 2:
-                pieces.append({
-                    "id": len(pieces),
-                    "vertices": vertices.copy(),
-                })
+                # Layer 1 = cutline (dış çizgi) — SADECE bunları parça olarak al
+                # Layer 2 = grain line
+                # Layer 8 = iç çizgiler (dart, dikiş, astar)
+                if poly_layer == "1":
+                    pieces.append({
+                        "id": len(pieces),
+                        "vertices": vertices.copy(),
+                        "layer": poly_layer,
+                    })
+                elif poly_layer == "2":
+                    grain_lines.append({
+                        "id": len(grain_lines),
+                        "vertices": vertices.copy(),
+                        "layer": poly_layer,
+                    })
             in_poly = False
             vertices = []
+            poly_layer = ""
 
         if code == "0" and value == "ENDBLK":
             in_block = False
