@@ -3,6 +3,9 @@ import glob, os, sys
 import numpy as np
 import time
 
+# Unbuffered output — Colab'da anında görsün
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+
 from dxf_parser import load_dxf
 from decoder import BLFDecoder
 from algorithms import ga_sa_hybrid
@@ -86,7 +89,7 @@ for dxf_path in dxf_files:
     seq = np.random.permutation(n).tolist()
     rots = [0.0] * n
     baseline = decoder.decode(seq, rots)
-    print(f"  Rastgele: {baseline['utilization']:.1f}%, {baseline['used_length']:.0f}mm")
+    print(f"  Rastgele: {baseline['utilization']:.1f}%, {baseline['used_length']:.0f}mm", flush=True)
 
     # GA+SA with progress callback
     from progress import write_progress
