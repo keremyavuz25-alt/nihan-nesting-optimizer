@@ -269,14 +269,18 @@ class NFPDecoder:
 
         Shapely/GEOS releases the GIL for C-level geometry ops, so threads
         provide real parallelism for the expensive parts (convex_hull, buffer,
-        difference, unary_union). Each individual is decoded independently.
+        difference, unary_union).
+
+        Thread count is capped at CPU count to avoid GIL contention overhead
+        that occurs when thread count >> CPU count.
         """
-        from concurrent.futures import ThreadPoolExecutor
         import os
+        from concurrent.futures import ThreadPoolExecutor
 
-        n_workers = min(len(sequences), os.cpu_count() or 4)
+        B = len(sequences)
+        n_workers = min(B, os.cpu_count() or 4)
 
-        if n_workers <= 1 or len(sequences) <= 4:
+        if n_workers <= 1 or B <= 4:
             return [self.fitness(s, r) for s, r in zip(sequences, rotations)]
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:

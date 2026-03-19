@@ -9,13 +9,11 @@ from matplotlib.path import Path as MplPath
 class BLFDecoder:
     """Skyline Bottom-Left Fill v3.0 — optimized.
 
-    Optimizations over v2.1:
+    Same placement decisions as v2.1, with:
     - Vectorized sliding window max for skyline queries
-    - Per-column bitmap height for precise incremental skyline update
-    - Early exit in x-scan (sorted by base_y, prune when top > best_top)
-    - Angle quantization (1deg) for higher cache hit rate
-    - Larger cache (4096 entries)
-    - Vectorized col_heights computation
+    - Batch collision detection per base_y level
+    - Incremental skyline update via per-column bitmap heights
+    - Angle quantization + large cache
     """
 
     def __init__(self, pieces: list[dict], bin_width: float = 1500.0,
@@ -29,11 +27,9 @@ class BLFDecoder:
         self._cache_max = cache_size
         self._angle_step = angle_step
 
-        # Precompute max_h once
         self._max_h = int(sum(max(p["width"], p["height"])
                               for p in pieces) * 1.5 / resolution)
 
-        # Cache: key -> (bitmap, col_heights)
         self._cache = {}
         for i, p in enumerate(pieces):
             for rot in [0, 90, 180, 270]:
@@ -69,23 +65,12 @@ class BLFDecoder:
 
     @staticmethod
     def _col_heights(bmp: np.ndarray) -> np.ndarray:
-        """Per-column: highest active row + 1 (0 if empty). Vectorized."""
+        """Per-column: highest active row + 1 (0 if empty)."""
         bh, bw = bmp.shape
-        # For each column, find the index of the last nonzero row
-        # Flip rows so argmax finds first nonzero from top = last from bottom
-        has_any = np.any(bmp, axis=0)  # which columns have any pixel
-        heights = np.zeros(bw, dtype=np.int32)
-        if not np.any(has_any):
-            return heights
-        # Use reversed cumulative approach: for active columns,
-        # find the maximum row index where bmp > 0
-        # bmp is (bh, bw). For each col j, we want max(row where bmp[row,j]>0)+1
-        row_indices = np.arange(bh).reshape(-1, 1)  # (bh, 1)
-        # masked: bmp * row_indices gives row index where active, 0 where not
-        # But 0 is ambiguous (row 0 vs inactive). Use bh as sentinel.
-        masked = np.where(bmp > 0, row_indices, -1)  # -1 for inactive
-        heights = np.max(masked, axis=0) + 1  # max row + 1, or 0 if all -1
-        heights[heights < 0] = 0  # shouldn't happen but safety
+        row_indices = np.arange(bh).reshape(-1, 1)
+        masked = np.where(bmp > 0, row_indices, -1)
+        heights = np.max(masked, axis=0) + 1
+        heights = np.clip(heights, 0, bh)
         return heights.astype(np.int32)
 
     def _get_bitmap(self, piece_idx: int, rotation: float):
@@ -109,7 +94,7 @@ class BLFDecoder:
         return entry
 
     def decode(self, sequence: list[int], rotations: list[float]) -> dict:
-        """Skyline-BLF placement — optimized."""
+        """Skyline-BLF placement — same decisions as v2.1, faster."""
         pieces = self.original_pieces
         res = self.res
         bin_w = self.bin_w
@@ -136,7 +121,7 @@ class BLFDecoder:
             if x_range <= 0:
                 continue
 
-            # OPTIMIZATION 1: Vectorized sliding window max
+            # Vectorized sliding window max
             if bw == 1:
                 base_ys = skyline[:x_range].copy()
             else:
@@ -146,33 +131,57 @@ class BLFDecoder:
                     strides=(skyline.strides[0], skyline.strides[0]))
                 base_ys = np.max(sky_windows, axis=1)
 
-            # Filter overflow
-            valid_mask = (base_ys + bh) < max_h
-            valid_xs = np.nonzero(valid_mask)[0]
-
+            # --- BATCH COLLISION DETECTION ---
+            # Group x positions by base_y and check collisions in bulk
             all_valid = []
 
-            if len(valid_xs) > 0:
-                # OPTIMIZATION 2: Sort by base_y, scan with early exit
-                sorted_order = np.argsort(base_ys[valid_xs])
-                sorted_xs = valid_xs[sorted_order]
-                sorted_bys = base_ys[sorted_xs]
+            # Get unique base_y values and their x positions
+            unique_bys = np.unique(base_ys)
 
-                best_top = max_h
+            for by_val in unique_bys:
+                by = int(by_val)
+                if by + bh >= max_h:
+                    continue
 
-                for i in range(len(sorted_xs)):
-                    by = int(sorted_bys[i])
+                # All x positions at this base_y level
+                xs_at_level = np.nonzero(base_ys == by_val)[0]
+
+                if len(xs_at_level) == 0:
+                    continue
+
+                # Extract the canvas strip at this y level
+                strip = canvas[by:by + bh, :]  # shape (bh, bin_w)
+
+                # For each x in xs_at_level, check if strip[:, x:x+bw] & bmp has any overlap
+                # Vectorize: create sliding windows over the strip
+                if len(xs_at_level) <= 3:
+                    # Few positions: check individually (faster than windowing overhead)
+                    for x in xs_at_level:
+                        x = int(x)
+                        region = strip[:, x:x + bw]
+                        if not np.any(region & bmp):
+                            all_valid.append((x, by, by + bh))
+                else:
+                    # Many positions: use vectorized sliding window collision
+                    # Create windows of the strip: shape (x_range, bh, bw)
+                    strip_windows = as_strided(
+                        strip,
+                        shape=(x_range, bh, bw),
+                        strides=(strip.strides[1], strip.strides[0], strip.strides[1]))
+
+                    # Only check positions in xs_at_level
+                    batch = strip_windows[xs_at_level]  # shape (n, bh, bw)
+
+                    # Batch collision: AND with bmp, then check any per sample
+                    collisions = batch & bmp[np.newaxis, :, :]  # broadcast
+                    has_collision = np.any(collisions.reshape(len(xs_at_level), -1), axis=1)
+
+                    # Collect valid positions
+                    free_mask = ~has_collision
+                    free_xs = xs_at_level[free_mask]
                     top = by + bh
-
-                    if top > best_top:
-                        break
-
-                    x = int(sorted_xs[i])
-                    region = canvas[by:by + bh, x:x + bw]
-                    if not np.any(region & bmp):
-                        all_valid.append((x, by, top))
-                        if top < best_top:
-                            best_top = top
+                    for x in free_xs:
+                        all_valid.append((int(x), by, top))
 
             if not all_valid:
                 best_y = int(np.max(skyline))
@@ -181,7 +190,7 @@ class BLFDecoder:
                     continue
                 all_valid = [(best_x, best_y, best_y + bh)]
 
-            # Top 3 candidates with variance tiebreak
+            # Top 3 + variance tiebreak
             all_valid.sort(key=lambda c: c[2])
             top3 = all_valid[:3]
 
@@ -203,7 +212,7 @@ class BLFDecoder:
             # Place piece
             canvas[best_y:best_y + bh, best_x:best_x + bw] |= bmp
 
-            # OPTIMIZATION 3: Incremental skyline update
+            # Incremental skyline update
             active_cols = col_h > 0
             sl = skyline[best_x:best_x + bw]
             sl[active_cols] = np.maximum(sl[active_cols],
