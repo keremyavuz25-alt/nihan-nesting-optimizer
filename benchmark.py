@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nesting Algoritma Benchmark — 8 algoritma PARALEL, DXF girdi, DXF/PLT/SVG çıktı."""
+"""Nesting Algoritma Benchmark — 8 algoritma PARALEL, BLF veya NFP decoder."""
 import sys
 import os
 import json
@@ -9,20 +9,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
 from dxf_parser import load_dxf
-from decoder import BLFDecoder
 from export import export_dxf, export_plt, export_svg
 
 
 def run_single_algorithm(args):
     """Tek algoritmayı çalıştır (paralel worker'da)."""
-    alg_name, dxf_path, bin_width, pop_size, max_iter, seed = args
+    alg_name, dxf_path, bin_width, pop_size, max_iter, seed, decoder_type = args
 
-    # Her process kendi decoder'ını oluşturur
     from dxf_parser import load_dxf
-    from decoder import BLFDecoder
     pieces = load_dxf(dxf_path)
-    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
     n = len(pieces)
+
+    # Decoder seç
+    if decoder_type == "nfp":
+        from nfp_decoder import NFPDecoder
+        decoder = NFPDecoder(pieces, bin_width=bin_width)
+    else:
+        from decoder import BLFDecoder
+        decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
 
     np.random.seed(seed)
 
@@ -50,14 +54,16 @@ def run_single_algorithm(args):
 
 
 def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
-                  pop_size: int = 50, max_iter: int = 500,
-                  n_runs: int = 1, output_dir: str = "results"):
+                  pop_size: int = 50, max_iter: int = 5000,
+                  n_runs: int = 1, output_dir: str = "results",
+                  decoder_type: str = "blf"):
     """Tüm algoritmaları PARALEL çalıştır."""
 
     print(f"{'='*60}")
     print(f"NESTING BENCHMARK (PARALEL)")
     print(f"{'='*60}")
     print(f"DXF: {dxf_path}")
+    print(f"Decoder: {decoder_type.upper()}")
     print(f"Kumaş eni: {bin_width} mm")
     print(f"Popülasyon: {pop_size}, İterasyon: {max_iter}, Tekrar: {n_runs}")
     print(f"CPU sayısı: {cpu_count()}")
@@ -77,10 +83,11 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
     jobs = []
     for alg_name in alg_names:
         for r in range(n_runs):
-            jobs.append((alg_name, dxf_path, bin_width, pop_size, max_iter, 42 + r))
+            jobs.append((alg_name, dxf_path, bin_width, pop_size, max_iter, 42 + r, decoder_type))
 
     print(f"Toplam {len(jobs)} iş, {min(len(jobs), cpu_count())} paralel worker")
     print(f"Başlatılıyor...\n")
+    sys.stdout.flush()
 
     # 3. Paralel çalıştır
     os.makedirs(output_dir, exist_ok=True)
@@ -95,10 +102,10 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
             try:
                 alg_name, result = future.result()
                 results_by_alg[alg_name].append(result)
-                print(f"  ✓ {alg_name}: {result['best_fitness']:.2f}% ({result['time']:.1f}s)")
+                print(f"  {alg_name}: {result['best_fitness']:.2f}% ({result['time']:.1f}s)")
                 sys.stdout.flush()
             except Exception as e:
-                print(f"  ✗ {job[0]}: HATA — {e}")
+                print(f"  {job[0]}: HATA — {e}")
                 sys.stdout.flush()
 
     t_total = time.time() - t_start
@@ -106,7 +113,14 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
 
     # 4. Sonuçları derle
     all_results = []
-    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
+
+    # Export için decoder oluştur
+    if decoder_type == "nfp":
+        from nfp_decoder import NFPDecoder
+        decoder = NFPDecoder(pieces, bin_width=bin_width)
+    else:
+        from decoder import BLFDecoder
+        decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
 
     for alg_name in alg_names:
         runs = results_by_alg[alg_name]
@@ -139,6 +153,7 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
 
     # 5. Karşılaştırma tablosu
     print(f"\n\n{'='*70}")
+    print(f"DECODER: {decoder_type.upper()}")
     print(f"{'ALGORİTMA':<25} {'EN İYİ':>8} {'ORT':>8} {'STD':>6} {'SÜRE':>8}")
     print(f"{'='*70}")
 
@@ -158,6 +173,7 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump({
             "dxf": os.path.basename(dxf_path),
+            "decoder": decoder_type,
             "pieces": len(pieces),
             "total_area_cm2": total_area / 100,
             "bin_width_mm": bin_width,
@@ -176,12 +192,14 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
 if __name__ == "__main__":
     dxf = sys.argv[1] if len(sys.argv) > 1 else "test.dxf"
     width = float(sys.argv[2]) if len(sys.argv) > 2 else 1500.0
+    dec = sys.argv[3] if len(sys.argv) > 3 else "blf"
 
     run_benchmark(
         dxf_path=dxf,
         bin_width=width,
         pop_size=50,
-        max_iter=500,
+        max_iter=5000,
         n_runs=1,
-        output_dir="results",
+        output_dir=f"results_{dec}",
+        decoder_type=dec,
     )

@@ -1,15 +1,16 @@
-"""Skyline-BLF decoder v2 — LRU cache, multi-candidate, unplaced penalty."""
+"""Skyline-BLF decoder v2.1 — LRU cache, multi-candidate, unplaced penalty."""
 import numpy as np
 from shapely.geometry import Polygon
 from shapely.affinity import rotate, translate
 
 
 class BLFDecoder:
-    """Skyline Bottom-Left Fill v2.
+    """Skyline Bottom-Left Fill v2.1.
 
+    v2.0 bug fix: multi-candidate artık TÜM x pozisyonlarını tarıyor.
     v1'den farklar:
     - Arbitrary açı desteği (LRU cache, 512 entry)
-    - Multi-candidate skyline (K=3, en düşük varyans)
+    - Multi-candidate skyline (en düşük top 3'ünden min varyans)
     - Unplaced piece penalty (fitness'ta -5%/parça)
     """
 
@@ -57,7 +58,6 @@ class BLFDecoder:
 
     def _get_bitmap(self, piece_idx: int, rotation: float) -> np.ndarray:
         """Cache'den bitmap al, yoksa rasterize et ve cache'e ekle."""
-        # 0.1° hassasiyetle cache key
         cache_key = (piece_idx, round(rotation % 360, 1))
 
         if cache_key in self._cache:
@@ -93,8 +93,8 @@ class BLFDecoder:
                 if bw > self.bin_w:
                     continue
 
-            # Multi-candidate: top-K pozisyon bul (K=3)
-            candidates = []
+            # TÜM geçerli pozisyonları tara (v2.0 bug fix: erken break yok)
+            all_valid = []
 
             for x in range(self.bin_w - bw + 1):
                 base_y = int(np.max(skyline[x:x + bw]))
@@ -108,39 +108,37 @@ class BLFDecoder:
 
                 if not np.any(region & bmp):
                     top = base_y + bh
-                    candidates.append((x, base_y, top))
+                    all_valid.append((x, base_y, top))
 
-                    # İlk 3 geçerli pozisyonu topla
-                    if len(candidates) >= 10:
-                        break
-
-            if not candidates:
+            if not all_valid:
                 # Fallback: en üste koy
                 best_y = int(np.max(skyline))
                 best_x = 0
                 if best_y + bh >= max_h:
                     continue
-                candidates = [(best_x, best_y, best_y + bh)]
+                all_valid = [(best_x, best_y, best_y + bh)]
 
-            # En iyi K=3 adaydan skyline varyansı en düşük olanı seç
-            best_candidate = None
-            best_score = float("inf")
+            # En düşük top'a göre sırala, ilk 3'ü al
+            all_valid.sort(key=lambda c: c[2])
+            top3 = all_valid[:3]
 
-            for x, y, top in sorted(candidates, key=lambda c: c[2])[:3]:
-                # Simüle et: skyline bu yerleştirmeden sonra nasıl olur?
-                sim_skyline = skyline.copy()
-                for xi in range(x, min(x + bw, self.bin_w)):
-                    col_max = top  # basit üst sınır tahmini
-                    sim_skyline[xi] = max(sim_skyline[xi], col_max)
+            if len(top3) == 1:
+                best_x, best_y = top3[0][0], top3[0][1]
+            else:
+                # Tiebreak: skyline varyansı en düşük olan
+                best_candidate = None
+                best_score = float("inf")
 
-                # Skor: düşük top + düşük varyans = iyi
-                variance = float(np.std(sim_skyline[:self.bin_w]))
-                score = top * 1.0 + variance * 0.5
-                if score < best_score:
-                    best_score = score
-                    best_candidate = (x, y)
+                for x, y, top in top3:
+                    sim_skyline = skyline.copy()
+                    for xi in range(x, min(x + bw, self.bin_w)):
+                        sim_skyline[xi] = max(sim_skyline[xi], top)
+                    variance = float(np.std(sim_skyline))
+                    if variance < best_score:
+                        best_score = variance
+                        best_candidate = (x, y)
 
-            best_x, best_y = best_candidate
+                best_x, best_y = best_candidate
 
             # Yerleştir
             canvas[best_y:best_y + bh, best_x:best_x + bw] |= bmp
