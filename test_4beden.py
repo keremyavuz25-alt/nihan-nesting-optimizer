@@ -102,9 +102,9 @@ for dxf_path in dxf_files:
     np.random.seed(42)
     t0 = time.time()
     result = ga_sa_hybrid(
-        decoder.fitness, n, pop_size=POP, max_iter=ITER, verbose=False,
+        decoder.fitness, n, pop_size=POP, max_iter=ITER, verbose=True,
         batch_fitness_fn=batch_fn,
-        progress_file=name,  # progress callback identifier
+        progress_file=name,
     )
     elapsed = time.time() - t0
 

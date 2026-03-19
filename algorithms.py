@@ -321,8 +321,8 @@ def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
             best_sol = deepcopy(pop[cur_best])
 
         history.append(best_fit)
-        if verbose and it % 500 == 0:
-            print(f"  GA+SA iter {it}: {best_fit:.2f}%")
+        if verbose and it % 50 == 0:
+            print(f"  GA+SA iter {it}/{max_iter}: {best_fit:.2f}% (pop={pop_size})", flush=True)
 
         # Progress dosyasına yaz (her 10 iterasyonda)
         if progress_file and it % 10 == 0:
