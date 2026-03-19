@@ -22,8 +22,8 @@ except ImportError:
 
 BIN_WIDTH = 1500
 N_BEDEN = 4
-POP = 100
-ITER = 500
+POP = 1000
+ITER = 1000
 
 dxf_dir = sys.argv[1] if len(sys.argv) > 1 else "dxf_samples"
 dxf_files = sorted(glob.glob(os.path.join(dxf_dir, "*.dxf")))
