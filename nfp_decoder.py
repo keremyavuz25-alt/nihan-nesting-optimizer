@@ -19,26 +19,101 @@ def _from_clipper(coords):
     return [(x / SCALE, y / SCALE) for x, y in coords]
 
 
-def _minkowski_sum(subject_coords, pattern_coords):
-    """Minkowski sum via pyclipper — doğru NFP hesabı."""
-    result = pyclipper.MinkowskiSum(
-        _to_clipper(subject_coords),
-        _to_clipper(pattern_coords),
-        True  # closed
-    )
-    if not result:
-        return Polygon()
+def _convex_decompose(coords):
+    """Konkav polygon'u convex parçalara böl (ear clipping tabanlı basit yaklaşım).
 
-    # En büyük polygon'u al (dış sınır)
-    best = max(result, key=lambda p: abs(pyclipper.Area(p)))
-    coords = _from_clipper(best)
-    if len(coords) < 3:
-        return Polygon()
-
+    Shapely triangulate + merge ile convex decomposition.
+    """
+    from shapely.ops import triangulate
     poly = Polygon(coords)
-    if not poly.is_valid:
-        poly = poly.buffer(0)
-    return poly
+    if poly.convex_hull.area - poly.area < 1.0:
+        # Zaten convex
+        return [coords]
+
+    # Triangulate et, sonra bitişik üçgenleri convex olarak birleştir
+    triangles = triangulate(poly)
+    convex_parts = []
+    for tri in triangles:
+        if poly.contains(tri.centroid):
+            convex_parts.append(list(tri.exterior.coords)[:-1])
+
+    if not convex_parts:
+        # Fallback: convex hull kullan
+        return [list(poly.convex_hull.exterior.coords)[:-1]]
+
+    return convex_parts
+
+
+def _minkowski_sum(subject_coords, pattern_coords):
+    """Minkowski sum — konkav parçalar için convex decomposition ile.
+
+    Konkav + konkav: her convex parça çifti için MinkowskiSum, sonra union.
+    """
+    subject_poly = Polygon(subject_coords + [subject_coords[0]])
+    pattern_poly = Polygon(pattern_coords + [pattern_coords[0]])
+
+    subject_is_convex = abs(subject_poly.convex_hull.area - subject_poly.area) < 1.0
+    pattern_is_convex = abs(pattern_poly.convex_hull.area - pattern_poly.area) < 1.0
+
+    if subject_is_convex and pattern_is_convex:
+        # İkisi de convex — direkt MinkowskiSum
+        result = pyclipper.MinkowskiSum(
+            _to_clipper(subject_coords),
+            _to_clipper(pattern_coords),
+            True
+        )
+        if not result:
+            return Polygon()
+        best = max(result, key=lambda p: abs(pyclipper.Area(p)))
+        coords = _from_clipper(best)
+        if len(coords) < 3:
+            return Polygon()
+        poly = Polygon(coords)
+        return poly.buffer(0) if not poly.is_valid else poly
+
+    # En az biri konkav — convex decomposition
+    if not subject_is_convex:
+        subject_parts = _convex_decompose(subject_coords)
+    else:
+        subject_parts = [subject_coords]
+
+    if not pattern_is_convex:
+        pattern_parts = _convex_decompose(pattern_coords)
+    else:
+        pattern_parts = [pattern_coords]
+
+    # Her convex çift için MinkowskiSum, sonra union
+    all_results = []
+    for sp in subject_parts:
+        for pp in pattern_parts:
+            try:
+                result = pyclipper.MinkowskiSum(
+                    _to_clipper(sp),
+                    _to_clipper(pp),
+                    True
+                )
+                for path in result:
+                    coords = _from_clipper(path)
+                    if len(coords) >= 3:
+                        p = Polygon(coords)
+                        if p.is_valid and not p.is_empty:
+                            all_results.append(p)
+            except Exception:
+                continue
+
+    if not all_results:
+        return Polygon()
+
+    if len(all_results) == 1:
+        return all_results[0]
+
+    # Union
+    from shapely.ops import unary_union
+    merged = unary_union(all_results)
+    if isinstance(merged, MultiPolygon):
+        # En büyüğünü al
+        return max(merged.geoms, key=lambda g: g.area)
+    return merged if not merged.is_empty else Polygon()
 
 
 class NFPDecoder:
