@@ -88,12 +88,20 @@ for dxf_path in dxf_files:
     baseline = decoder.decode(seq, rots)
     print(f"  Rastgele: {baseline['utilization']:.1f}%, {baseline['used_length']:.0f}mm")
 
-    # GA+SA
+    # GA+SA with progress callback
+    from progress import write_progress
+    _t0_prog = time.time()
+    _name_prog = name
+
+    def _on_progress(it, best_fit):
+        write_progress(_name_prog, it, ITER, best_fit, time.time() - _t0_prog)
+
     np.random.seed(42)
     t0 = time.time()
     result = ga_sa_hybrid(
         decoder.fitness, n, pop_size=POP, max_iter=ITER, verbose=False,
         batch_fitness_fn=batch_fn,
+        progress_file=name,  # progress callback identifier
     )
     elapsed = time.time() - t0
 

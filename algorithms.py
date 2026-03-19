@@ -249,7 +249,7 @@ def genetic_algorithm(fitness_fn, n_pieces: int, pop_size: int = 50,
 
 def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
                  max_iter: int = 5000, sa_iters: int = 50, verbose: bool = False,
-                 batch_fitness_fn=None) -> dict:
+                 batch_fitness_fn=None, progress_file: str = None) -> dict:
     pop = [random_solution(n_pieces) for _ in range(pop_size)]
     fits = _batch_eval(pop, fitness_fn, batch_fitness_fn)
 
@@ -323,6 +323,14 @@ def ga_sa_hybrid(fitness_fn, n_pieces: int, pop_size: int = 50,
         history.append(best_fit)
         if verbose and it % 500 == 0:
             print(f"  GA+SA iter {it}: {best_fit:.2f}%")
+
+        # Progress dosyasına yaz (her 10 iterasyonda)
+        if progress_file and it % 10 == 0:
+            try:
+                from progress import write_progress
+                write_progress(progress_file, it, max_iter, best_fit, time.time() - t0)
+            except Exception:
+                pass
 
     return {"name": "GA+SA (Hibrit)", "best_fitness": best_fit,
             "best_solution": best_sol, "history": history, "time": time.time() - t0}
