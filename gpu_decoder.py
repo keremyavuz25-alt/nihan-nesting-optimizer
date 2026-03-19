@@ -352,7 +352,7 @@ class GPUDecoder:
                     linear_idx = flat_bi * bin_w + flat_col  # [P * bw_p]
                     flat_sky = skylines.view(-1)  # [B * bin_w]
                     flat_sky.scatter_reduce_(
-                        0, linear_idx.long(), flat_top,
+                        0, linear_idx.long(), flat_top.to(flat_sky.dtype),
                         reduce='amax', include_self=True)
 
                     placed_mask[p_bi, pid] = True
