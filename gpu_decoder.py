@@ -246,7 +246,7 @@ class GPUDecoder:
                     if len(r_idx) == 0:
                         break
 
-                    try_y = base_ys_all[r_idx, try_x]  # [R]
+                    try_y = base_ys_all[r_idx, try_x].long()  # [R] — match final_y dtype
 
                     # Batch collision check: for each active member, extract region
                     # and test overlap with bmp
@@ -309,7 +309,7 @@ class GPUDecoder:
                     if fb_ok.any():
                         fb_place = fb_idx[fb_ok]
                         final_x[fb_place] = 0
-                        final_y[fb_place] = fb_y[fb_ok]
+                        final_y[fb_place] = fb_y[fb_ok].long()
                         remaining[fb_place] = False
 
                 # === Apply placements to canvas + skyline (BATCH) ===
