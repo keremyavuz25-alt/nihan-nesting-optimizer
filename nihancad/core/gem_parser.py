@@ -242,150 +242,219 @@ class GemParser:
     ) -> list[Piece]:
         """Match contours to piece names and build Piece objects with full layer data.
 
-        GEMX structure per piece block (between consecutive piece names):
-          - CUTLINE:    Bezier contour, max(w,h) > 100 mm, vertex count > 10
-          - GRAINLINE:  2 vertices, one dimension > 50 mm, other ≈ 0
-          - DRILL:      1 vertex, 0×0 bbox (single point)
-          - NOTCH_LINE: 2 vertices, max(w,h) < 15 mm
-          - NOTCH_SYM:  4 vertices, max(w,h) < 50 mm
+        Grading-aware: GEMX files may contain multiple sizes of the same piece
+        as separate expanded contours.  These are detected by spatial clustering
+        of cutline contours — contours at similar locations but different sizes
+        belong to the same piece template at different grades.
 
-        Size labels (e.g. '38') and production notes ('TELALI', '4ADET ...')
-        also appear as names but are filtered out.
+        Each graded size becomes a separate Piece with a ``size`` label.
         """
         if not contours:
             return []
 
-        # Classify names into piece names vs size/meta labels
+        # ── Step 1: collect all cutline-sized contours with centroids ──
+        _CUTLINE_MIN_MM = 60.0  # lowered from 100 to catch smaller pieces
+
+        cutline_candidates: list[dict] = []
+        small_contours: list[dict] = []
+
+        for c in contours:
+            w, h, n = c["width"], c["height"], c["count"]
+            maxdim = max(w, h)
+            if maxdim > _CUTLINE_MIN_MM and n > 5:
+                xs = [v[0] for v in c["vertices"]]
+                ys = [v[1] for v in c["vertices"]]
+                c["cx"] = (min(xs) + max(xs)) / 2
+                c["cy"] = (min(ys) + max(ys)) / 2
+                cutline_candidates.append(c)
+            else:
+                small_contours.append(c)
+
+        # ── Step 2: extract piece names ──
         _META_LIKE = {
             "KUMAS", "ASTAR", "TELA", "CIZIM", "ÇİZİM", "SEZON",
         }
 
         def _is_piece_name(name: str) -> bool:
-            """True if *name* looks like a piece identifier, not a size or note."""
             if name in _META_LIKE:
                 return False
-            # Pure numbers are size labels (e.g. '38', '42')
             if name.replace(".", "").isdigit():
                 return False
-            # Production notes contain spaces or keywords
             if "ADET" in name or "KESILSIN" in name or "TELALI" == name:
                 return False
             if len(name) < 2:
                 return False
             return True
 
-        # Find first occurrence of each unique piece name
-        seen_pieces: dict[str, int] = {}  # name → first offset
+        seen_pieces: dict[str, int] = {}
         piece_order: list[str] = []
         for off, name in names:
             if _is_piece_name(name) and name not in seen_pieces:
                 seen_pieces[name] = off
                 piece_order.append(name)
 
-        if not piece_order:
-            # Fallback: use old bbox-filtered approach
-            big_contours = [c for c in contours
-                            if c["width"] >= _MIN_PIECE_BBOX_MM
-                            and c["height"] >= _MIN_PIECE_BBOX_MM]
-            pieces = []
-            for idx, c in enumerate(big_contours):
-                pts = self._tessellate_bezier_contour(c["vertices"])
-                if len(pts) >= 3:
-                    pieces.append(self._build_piece(idx, f"PIECE_{idx+1}", pts, idx))
-            return pieces
+        # ── Step 3: group cutlines by piece name ──
+        # Each piece name appears multiple times in the file (once per size).
+        # Collect all name occurrences, then for each occurrence find the
+        # closest cutline contour → that's this piece at this size.
+        all_name_occurrences: list[tuple[str, int]] = [
+            (name, off) for off, name in names if _is_piece_name(name)
+        ]
 
-        # For each piece name, collect ALL contours between its first occurrence
-        # and the next piece name's first occurrence
+        # For each piece name, collect all cutline contours assigned to it
+        named_cutlines: dict[str, list[dict]] = {}
+        for pname in piece_order:
+            # Get ALL occurrences of this name
+            occurrences = [off for name, off in all_name_occurrences if name == pname]
+            cutlines_for_piece: list[dict] = []
+            for occ_off in occurrences:
+                # Find the closest cutline contour AFTER this name occurrence
+                best_c = None
+                best_dist = float("inf")
+                for c in cutline_candidates:
+                    if c["offset"] > occ_off:
+                        dist = c["offset"] - occ_off
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_c = c
+                if best_c is not None and best_dist < 500_000:  # within 500KB
+                    cutlines_for_piece.append(best_c)
+            named_cutlines[pname] = cutlines_for_piece
+
+        # Build named_clusters from deduplicated cutlines per piece
+        named_clusters: list[tuple[str, list[dict]]] = []
+        for pname in piece_order:
+            members = named_cutlines.get(pname, [])
+            if members:
+                named_clusters.append((pname, members))
+
+        # ── Step 5: deduplicate within clusters ──
+        # Within a cluster, contours with identical bbox are duplicates
+        # (cutline + drawing layer of same size). Keep the one with most vertices.
+        # Contours with different bbox = different sizes.
+        def _bbox_key(c: dict) -> tuple:
+            # Round to nearest 20mm to merge cutline + drawing layer of same size.
+            # Different graded sizes typically differ by >=20mm in at least one dimension.
+            return (round(c["width"] / 20) * 20, round(c["height"] / 20) * 20)
+
         pieces: list[Piece] = []
         piece_id = 0
 
-        for idx, pname in enumerate(piece_order):
-            region_start = seen_pieces[pname]
-            if idx + 1 < len(piece_order):
-                region_end = seen_pieces[piece_order[idx + 1]]
-            else:
-                region_end = len(data)
+        for pname, members in named_clusters:
+            # Group by bbox → deduplicate
+            bbox_groups: dict[tuple, list[dict]] = {}
+            for c in members:
+                key = _bbox_key(c)
+                bbox_groups.setdefault(key, []).append(c)
 
-            group = [c for c in contours if region_start <= c["offset"] < region_end]
-            if not group:
-                continue
+            # For each unique bbox (= unique size), pick best contour
+            size_contours: list[dict] = []
+            for key, group in bbox_groups.items():
+                best = max(group, key=lambda c: c["count"])
+                size_contours.append(best)
 
-            # Classify contours in this piece's region
-            cutline_c = None
-            grainline_c = None
-            drill_pts: list[tuple[float, float]] = []
-            notch_pts: list[tuple[float, float, float]] = []  # (x, y, angle)
+            # Sort by area (width * height) — smallest to largest
+            size_contours.sort(key=lambda c: c["width"] * c["height"])
 
-            for c in group:
-                w, h, n = c["width"], c["height"], c["count"]
-                maxdim = max(w, h)
-
-                if maxdim > 100 and n > 10:
-                    # CUTLINE — take the one with most vertices
-                    if cutline_c is None or n > cutline_c["count"]:
-                        cutline_c = c
-                elif n == 2 and maxdim > 50 and min(w, h) < 5:
-                    # GRAINLINE — long thin line
-                    grainline_c = c
-                elif n == 1 and maxdim < 0.1:
-                    # DRILL POINT — single point at origin-relative position
-                    vx, vy, _ = c["vertices"][0]
-                    drill_pts.append((vx, vy))
-                elif n == 2 and maxdim < 15:
-                    # NOTCH LINE — short 2-point segment
-                    v0 = c["vertices"][0]
-                    v1 = c["vertices"][1]
-                    mx = (v0[0] + v1[0]) / 2
-                    my = (v0[1] + v1[1]) / 2
-                    angle = math.degrees(math.atan2(v1[1] - v0[1], v1[0] - v0[0]))
-                    notch_pts.append((mx, my, angle))
-
-            if cutline_c is None:
-                continue
-
-            # Tessellate cutline Bezier
-            cutline_pts = self._tessellate_bezier_contour(cutline_c["vertices"])
-            if len(cutline_pts) < 3:
-                continue
-
-            # Build grainline
-            grainlines: list[Grainline] = []
-            if grainline_c is not None:
-                v0 = grainline_c["vertices"][0]
-                v1 = grainline_c["vertices"][1]
-                gx = (v0[0] + v1[0]) / 2
-                gy = (v0[1] + v1[1]) / 2
-                g_angle = math.degrees(math.atan2(v1[1] - v0[1], v1[0] - v0[0]))
-                g_length = math.hypot(v1[0] - v0[0], v1[1] - v0[1])
-                grainlines.append(Grainline(x=gx, y=gy, angle=g_angle, length=g_length))
-
-            # Build drill points
-            drill_points: list[DrillPoint] = [DrillPoint(x=dx, y=dy) for dx, dy in drill_pts]
-
-            # Build notches — deduplicate pairs (GEMX stores each notch twice)
-            notches: list[Notch] = []
-            used_notch: set[int] = set()
-            for i, (nx, ny, na) in enumerate(notch_pts):
-                if i in used_notch:
+            # ── Step 6: build a Piece for each size ──
+            num_sizes = len(size_contours)
+            for size_idx, cutline_c in enumerate(size_contours):
+                cutline_pts = self._tessellate_bezier_contour(cutline_c["vertices"])
+                if len(cutline_pts) < 3:
                     continue
-                # Check for a pair within 1mm
-                for j in range(i + 1, len(notch_pts)):
-                    if j in used_notch:
-                        continue
-                    ox, oy, _ = notch_pts[j]
-                    if math.hypot(nx - ox, ny - oy) < 1.0:
-                        used_notch.add(j)
-                        break
-                notches.append(Notch(x=nx, y=ny, label="", edge_angle=na))
 
-            piece = self._build_piece(piece_id, pname, cutline_pts, piece_id)
-            piece.grainlines = grainlines
-            piece.drill_points = drill_points
-            piece.notches = notches
-            pieces.append(piece)
-            piece_id += 1
+                # Find nearby small contours for this specific size
+                # (within cutline bbox + small margin)
+                cx, cy = cutline_c["cx"], cutline_c["cy"]
+                half_w = cutline_c["width"] / 2 + 50
+                half_h = cutline_c["height"] / 2 + 50
+                nearby = [
+                    sc for sc in small_contours
+                    if (abs(sc.get("_cx", self._contour_cx(sc)) - cx) < half_w
+                        and abs(sc.get("_cy", self._contour_cy(sc)) - cy) < half_h)
+                ]
+
+                grainline_c = None
+                drill_pts: list[tuple[float, float]] = []
+                notch_pts: list[tuple[float, float, float]] = []
+
+                for sc in nearby:
+                    w, h, n = sc["width"], sc["height"], sc["count"]
+                    maxdim = max(w, h)
+                    if n == 2 and maxdim > 50 and min(w, h) < 5:
+                        grainline_c = sc
+                    elif n == 1 and maxdim < 0.1:
+                        vx, vy, _ = sc["vertices"][0]
+                        drill_pts.append((vx, vy))
+                    elif n == 2 and maxdim < 15:
+                        v0, v1 = sc["vertices"][0], sc["vertices"][1]
+                        mx = (v0[0] + v1[0]) / 2
+                        my = (v0[1] + v1[1]) / 2
+                        angle = math.degrees(math.atan2(v1[1] - v0[1], v1[0] - v0[0]))
+                        notch_pts.append((mx, my, angle))
+
+                # Build grainline
+                grainlines: list[Grainline] = []
+                if grainline_c is not None:
+                    v0 = grainline_c["vertices"][0]
+                    v1 = grainline_c["vertices"][1]
+                    gx = (v0[0] + v1[0]) / 2
+                    gy = (v0[1] + v1[1]) / 2
+                    g_angle = math.degrees(math.atan2(v1[1] - v0[1], v1[0] - v0[0]))
+                    g_length = math.hypot(v1[0] - v0[0], v1[1] - v0[1])
+                    grainlines.append(Grainline(x=gx, y=gy, angle=g_angle, length=g_length))
+
+                # Build drill points
+                drill_points = [DrillPoint(x=dx, y=dy) for dx, dy in drill_pts]
+
+                # Build notches — deduplicate pairs
+                notches: list[Notch] = []
+                used_notch: set[int] = set()
+                for i, (nx, ny, na) in enumerate(notch_pts):
+                    if i in used_notch:
+                        continue
+                    for j in range(i + 1, len(notch_pts)):
+                        if j in used_notch:
+                            continue
+                        ox, oy, _ = notch_pts[j]
+                        if math.hypot(nx - ox, ny - oy) < 1.0:
+                            used_notch.add(j)
+                            break
+                    notches.append(Notch(x=nx, y=ny, label="", edge_angle=na))
+
+                # Size label
+                if num_sizes == 1:
+                    display_name = pname
+                    size_label = ""
+                else:
+                    size_label = str(size_idx + 1)
+                    display_name = f"{pname} [{size_label}]"
+
+                piece = self._build_piece(piece_id, display_name, cutline_pts, piece_id)
+                piece.size = size_label
+                piece.grainlines = grainlines
+                piece.drill_points = drill_points
+                piece.notches = notches
+                pieces.append(piece)
+                piece_id += 1
 
         return pieces
+
+    @staticmethod
+    def _contour_cx(c: dict) -> float:
+        """Compute and cache centroid X for a contour."""
+        if "_cx" not in c:
+            xs = [v[0] for v in c["vertices"]]
+            c["_cx"] = (min(xs) + max(xs)) / 2
+        return c["_cx"]
+
+    @staticmethod
+    def _contour_cy(c: dict) -> float:
+        """Compute and cache centroid Y for a contour."""
+        if "_cy" not in c:
+            ys = [v[1] for v in c["vertices"]]
+            c["_cy"] = (min(ys) + max(ys)) / 2
+        return c["_cy"]
 
     def _cluster_by_bbox(
         self, contours: list[dict], tolerance: float = 0.1
