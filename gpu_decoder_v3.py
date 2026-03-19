@@ -113,8 +113,7 @@ class GPUDecoderV3:
         seq_t = torch.tensor(sequences, dtype=torch.long, device=dev)
         rot_t = torch.tensor(rotations, dtype=torch.float32, device=dev)
 
-        row_off = torch.arange(max_bh, device=dev)
-        col_off = torch.arange(max_bw, device=dev)
+        # row_off ve col_off her step'te dinamik oluşturulacak
 
         for step in range(n):
             pids = seq_t[:, step]  # [B]
@@ -127,14 +126,18 @@ class GPUDecoderV3:
             bmps = self.bmp_tensor[pids, ai]  # [B, max_bh, max_bw]
             szs = self.sizes[pids, ai]  # [B, 2] → (bh, bw)
 
-            # Her birey için gerçek bh/bw farklı olabilir ama max ile çalışıyoruz
-            # Padding sıfır olduğu için collision'da sorun çıkmaz
-            # Ama skyline scan'de bw önemli — en büyük bw kullanıyoruz
-            # Bu hafif fire artışına neden olabilir ama hız kazancı büyük
+            # Her birey farklı parça koyuyor → farklı boyutlar
+            # GPU batch için bu step'teki MAX gerçek boyutu kullan
+            # Padding sıfır → collision'da sorun yok, skyline'da max bh kadar artış
+            step_bhs = szs[:, 0]  # [B]
+            step_bws = szs[:, 1]  # [B]
+            bh = int(step_bhs.max().item())  # bu step'teki en büyük yükseklik
+            bw_p = int(step_bws.max().item())  # bu step'teki en büyük genişlik
+            if bh == 0 or bw_p == 0:
+                continue
 
-            # Tüm bireyler için aynı (max) boyut kullan
-            bh = max_bh
-            bw_p = max_bw
+            # Bitmap'leri gerçek boyuta kırp (pad'i kaldır)
+            bmps = bmps[:, :bh, :bw_p]  # [B, bh, bw_p]
 
             x_range = bin_w - bw_p + 1
             if x_range <= 0:
@@ -164,8 +167,10 @@ class GPUDecoderV3:
             gy = base_ys[good, gx].long()
 
             # BATCH collision check — tüm G bireyler tek seferde
-            rows = gy.unsqueeze(1) + row_off.unsqueeze(0)  # [G, max_bh]
-            cols = gx.unsqueeze(1) + col_off.unsqueeze(0)  # [G, max_bw]
+            row_off = torch.arange(bh, device=dev)
+            col_off = torch.arange(bw_p, device=dev)
+            rows = gy.unsqueeze(1) + row_off.unsqueeze(0)  # [G, bh]
+            cols = gx.unsqueeze(1) + col_off.unsqueeze(0)  # [G, bw_p]
 
             row_ok = rows[:, -1] < max_h
             col_ok = cols[:, -1] < bin_w
@@ -202,8 +207,8 @@ class GPUDecoderV3:
             p_x = gx[place]
             p_y = gy[place]
 
-            p_rows = p_y.unsqueeze(1) + row_off.unsqueeze(0)
-            p_cols = p_x.unsqueeze(1) + col_off.unsqueeze(0)
+            p_rows = p_y.unsqueeze(1) + torch.arange(bh, device=dev).unsqueeze(0)
+            p_cols = p_x.unsqueeze(1) + torch.arange(bw_p, device=dev).unsqueeze(0)
 
             p_bi3 = p_bi.view(P, 1, 1).expand(P, bh, bw_p)
             p_ry3 = p_rows.unsqueeze(2).expand(P, bh, bw_p)
