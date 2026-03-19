@@ -1,34 +1,36 @@
-"""Skyline-BLF decoder — O(n) placement, numpy raster collision."""
+"""Skyline-BLF decoder v2 — LRU cache, multi-candidate, unplaced penalty."""
 import numpy as np
 from shapely.geometry import Polygon
 from shapely.affinity import rotate, translate
 
 
 class BLFDecoder:
-    """Skyline Bottom-Left Fill — skyline profile ile hızlı yerleştirme.
+    """Skyline Bottom-Left Fill v2.
 
-    Her adımda skyline (üst profil) takip edilir.
-    Yeni parça skyline'ın en alçak noktasına yerleştirilir.
-    Collision check: numpy bitmap AND operasyonu.
+    v1'den farklar:
+    - Arbitrary açı desteği (LRU cache, 512 entry)
+    - Multi-candidate skyline (K=3, en düşük varyans)
+    - Unplaced piece penalty (fitness'ta -5%/parça)
     """
 
     def __init__(self, pieces: list[dict], bin_width: float = 1500.0,
-                 resolution: float = 3.0):
+                 resolution: float = 3.0, cache_size: int = 512):
         self.original_pieces = pieces
         self.bin_width = bin_width
         self.res = resolution
         self.n = len(pieces)
         self.bin_w = int(bin_width / resolution)
+        self._cache_max = cache_size
 
-        # Bitmap cache (4 standart rotasyon)
+        # LRU cache — cardinal açılar warm, arbitrary açılar on-demand
         self._cache = {}
         for i, p in enumerate(pieces):
             for rot in [0, 90, 180, 270]:
-                bmp = self._rasterize_fast(p["polygon"], rot)
-                self._cache[(i, rot)] = bmp
+                key = (i, float(rot))
+                self._cache[key] = self._rasterize_fast(p["polygon"], rot)
 
     def _rasterize_fast(self, poly: Polygon, rotation: float) -> np.ndarray:
-        """Hızlı rasterize — matplotlib path kullanarak."""
+        """Hızlı rasterize — matplotlib path ile."""
         if rotation != 0:
             poly = rotate(poly, rotation, origin="centroid", use_radians=False)
             b = poly.bounds
@@ -45,7 +47,6 @@ class BLFDecoder:
         coords = np.array(poly.exterior.coords)
         path = Path(coords)
 
-        # Grid noktaları oluştur
         xs = np.arange(w) * self.res + b[0]
         ys = np.arange(h) * self.res + b[1]
         xx, yy = np.meshgrid(xs, ys)
@@ -54,69 +55,92 @@ class BLFDecoder:
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
+    def _get_bitmap(self, piece_idx: int, rotation: float) -> np.ndarray:
+        """Cache'den bitmap al, yoksa rasterize et ve cache'e ekle."""
+        # 0.1° hassasiyetle cache key
+        cache_key = (piece_idx, round(rotation % 360, 1))
+
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        bmp = self._rasterize_fast(
+            self.original_pieces[piece_idx]["polygon"], rotation
+        )
+
+        if len(self._cache) < self._cache_max:
+            self._cache[cache_key] = bmp
+
+        return bmp
+
     def decode(self, sequence: list[int], rotations: list[float]) -> dict:
-        """Skyline-BLF yerleştirme."""
+        """Skyline-BLF yerleştirme — multi-candidate (K=3)."""
         max_h = int(sum(max(p["width"], p["height"]) for p in self.original_pieces) * 1.5 / self.res)
         canvas = np.zeros((max_h, self.bin_w), dtype=np.uint8)
-
-        # Skyline: her x kolonu için en üst dolu y
         skyline = np.zeros(self.bin_w, dtype=np.int32)
 
         placed = []
 
         for idx in sequence:
             rot = rotations[idx]
-            rot_key = rot if rot in (0, 90, 180, 270) else None
-
-            if rot_key is not None and (idx, int(rot_key)) in self._cache:
-                bmp = self._cache[(idx, int(rot_key))]
-            else:
-                bmp = self._rasterize_fast(self.original_pieces[idx]["polygon"], rot)
-
+            bmp = self._get_bitmap(idx, rot)
             bh, bw = bmp.shape
 
+            # Ene sığmıyorsa 90° döndür
             if bw > self.bin_w:
-                alt_rot = (rot + 90) % 360
-                alt_key = alt_rot if alt_rot in (0, 90, 180, 270) else None
-                if alt_key is not None and (idx, int(alt_key)) in self._cache:
-                    bmp = self._cache[(idx, int(alt_key))]
-                else:
-                    bmp = self._rasterize_fast(self.original_pieces[idx]["polygon"], alt_rot)
+                rot = (rot + 90) % 360
+                bmp = self._get_bitmap(idx, rot)
                 bh, bw = bmp.shape
-                rot = alt_rot
                 if bw > self.bin_w:
                     continue
 
-            # Skyline-BLF: her x pozisyonunda minimum başlangıç y'yi bul
-            best_x, best_y = 0, max_h
-            best_top = max_h
+            # Multi-candidate: top-K pozisyon bul (K=3)
+            candidates = []
 
             for x in range(self.bin_w - bw + 1):
-                # Bu x'te parça tabanının oturması gereken y
                 base_y = int(np.max(skyline[x:x + bw]))
 
                 if base_y + bh >= max_h:
                     continue
 
-                # Bitmap collision check
                 region = canvas[base_y:base_y + bh, x:x + bw]
                 if region.shape != bmp.shape:
                     continue
 
-                overlap = np.any(region & bmp)
-                if not overlap:
+                if not np.any(region & bmp):
                     top = base_y + bh
-                    if top < best_top:
-                        best_top = top
-                        best_x = x
-                        best_y = base_y
+                    candidates.append((x, base_y, top))
 
-            if best_top >= max_h:
-                # Fallback
+                    # İlk 3 geçerli pozisyonu topla
+                    if len(candidates) >= 10:
+                        break
+
+            if not candidates:
+                # Fallback: en üste koy
                 best_y = int(np.max(skyline))
                 best_x = 0
                 if best_y + bh >= max_h:
                     continue
+                candidates = [(best_x, best_y, best_y + bh)]
+
+            # En iyi K=3 adaydan skyline varyansı en düşük olanı seç
+            best_candidate = None
+            best_score = float("inf")
+
+            for x, y, top in sorted(candidates, key=lambda c: c[2])[:3]:
+                # Simüle et: skyline bu yerleştirmeden sonra nasıl olur?
+                sim_skyline = skyline.copy()
+                for xi in range(x, min(x + bw, self.bin_w)):
+                    col_max = top  # basit üst sınır tahmini
+                    sim_skyline[xi] = max(sim_skyline[xi], col_max)
+
+                # Skor: düşük top + düşük varyans = iyi
+                variance = float(np.std(sim_skyline[:self.bin_w]))
+                score = top * 1.0 + variance * 0.5
+                if score < best_score:
+                    best_score = score
+                    best_candidate = (x, y)
+
+            best_x, best_y = best_candidate
 
             # Yerleştir
             canvas[best_y:best_y + bh, best_x:best_x + bw] |= bmp
@@ -140,7 +164,7 @@ class BLFDecoder:
         # Verimlilik
         if not placed:
             return {"placements": [], "used_length": 0, "utilization": 0.0,
-                    "total_piece_area": 0, "bin_area": 0}
+                    "total_piece_area": 0, "bin_area": 0, "n_placed": 0}
 
         used_length = float(np.max(skyline)) * self.res
         total_piece_area = sum(self.original_pieces[p["piece_id"]]["area"] for p in placed)
@@ -152,6 +176,7 @@ class BLFDecoder:
             "utilization": (total_piece_area / bin_area * 100) if bin_area > 0 else 0.0,
             "total_piece_area": total_piece_area,
             "bin_area": bin_area,
+            "n_placed": len(placed),
         }
 
     def _get_placed_polygon(self, piece_idx: int, rotation: float,
@@ -164,4 +189,9 @@ class BLFDecoder:
         return translate(poly, x, y)
 
     def fitness(self, sequence: list[int], rotations: list[float]) -> float:
-        return self.decode(sequence, rotations)["utilization"]
+        """Fitness = utilization - unplaced penalty."""
+        result = self.decode(sequence, rotations)
+        base = result["utilization"]
+        unplaced = self.n - result["n_placed"]
+        penalty = unplaced * 5.0
+        return max(0.0, base - penalty)

@@ -21,7 +21,7 @@ def run_single_algorithm(args):
     from dxf_parser import load_dxf
     from decoder import BLFDecoder
     pieces = load_dxf(dxf_path)
-    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=5.0)
+    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
     n = len(pieces)
 
     np.random.seed(seed)
@@ -106,7 +106,7 @@ def run_benchmark(dxf_path: str, bin_width: float = 1500.0,
 
     # 4. Sonuçları derle
     all_results = []
-    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=5.0)
+    decoder = BLFDecoder(pieces, bin_width=bin_width, resolution=3.0)
 
     for alg_name in alg_names:
         runs = results_by_alg[alg_name]
