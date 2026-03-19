@@ -40,8 +40,18 @@ _OUTLIER_SIGMA = 2.5        # MAD-based outlier threshold
 class GemParser:
     """Parse GEM and GEMX files from Gemini CAD Systems."""
 
-    def parse(self, filepath: str) -> list[Piece]:
+    def parse(
+        self,
+        filepath: str,
+        size_labels: list[str | int] | None = None,
+    ) -> list[Piece]:
         """Auto-detect GEM vs GEMX and parse.
+
+        Args:
+            filepath: Path to .gem or .gemx file.
+            size_labels: Optional real size labels from ölçü tablosu
+                (e.g. [38, 40, 42, 44] or [1, 2, 3]).
+                Mapped to graded sizes in order.
 
         Returns list of Piece objects compatible with DXF-parsed pieces.
         """
@@ -57,7 +67,7 @@ class GemParser:
         try:
             names = zf.namelist()
             if any(n == "models/rp2.rp" or n.endswith("/rp2.rp") for n in names):
-                return self._parse_gemx(zf)
+                return self._parse_gemx(zf, size_labels=size_labels)
             # Legacy GEM: look for an inner .gem binary
             gem_inner = [n for n in names if n.lower().endswith(".gem")]
             if gem_inner:
@@ -72,19 +82,23 @@ class GemParser:
     # GEMX format
     # -----------------------------------------------------------------------
 
-    def _parse_gemx(self, zf: zipfile.ZipFile) -> list[Piece]:
+    def _parse_gemx(
+        self,
+        zf: zipfile.ZipFile,
+        size_labels: list[str | int] | None = None,
+    ) -> list[Piece]:
         """Parse GEMX format (models/rp2.rp TLV tree with Bezier splines).
 
-        GEMX stores graded pattern pieces.  Each piece block contains:
-          - cutline (large Bezier contour, >100 mm bbox)
-          - grainline (2-vertex line, one dimension >50 mm, other ≈0)
-          - drill points (single-vertex, 0×0 bbox)
-          - notch lines (2-vertex, <15 mm)
-          - notch symbols (4-vertex, <50 mm)
+        Uses the grading engine to extract multiple sizes per piece.
+        Each piece-name repetition in the file = a different graded size.
 
-        Piece names and size labels ('38') appear as UTF-16LE wstr tags
-        interleaved with the geometry.
+        Args:
+            zf: Open ZipFile for the GEMX.
+            size_labels: Optional real size labels from ölçü tablosu
+                (e.g. [38, 40, 42, 44]).  Mapped to sizes in order.
         """
+        from nihancad.core.grading import extract_graded_pieces, graded_pieces_to_flat
+
         rp2_name = next(
             (n for n in zf.namelist() if n == "models/rp2.rp" or n.endswith("/rp2.rp")),
             None,
@@ -100,8 +114,16 @@ class GemParser:
         # 2) Extract piece names from UTF-16LE strings
         piece_names = self._extract_piece_names(data)
 
-        # 3) Match contours to names and build pieces with full layer data
-        return self._match_gemx_pieces(all_contours, piece_names, data)
+        # 3) Use grading engine to extract all sizes
+        graded = extract_graded_pieces(
+            all_contours,
+            piece_names,
+            self._tessellate_bezier_contour,
+            size_labels=size_labels,
+        )
+
+        # 4) Flatten to Piece list
+        return graded_pieces_to_flat(graded)
 
     def _extract_all_gemx_contours(self, data: bytes) -> list[dict]:
         """Find ALL v<ui8b13> geometry sections — no bbox filter.
