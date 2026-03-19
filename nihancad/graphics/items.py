@@ -96,6 +96,7 @@ class PieceGroup(QGraphicsItemGroup):
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setAcceptHoverEvents(True)
 
         self._hovered = False
@@ -469,6 +470,169 @@ class RefLineItem(QGraphicsLineItem):
     def update_layer(self, layer: Layer) -> None:
         self._layer = layer
         self._apply_style()
+
+
+# ── InternalLineItem ──────────────────────────────────────────────
+
+
+class InternalLineItem(QGraphicsPathItem):
+    """Internal construction lines (darts, pleats, stitching) from L8 open POLYLINE."""
+
+    def __init__(self, internal_lines: list, layer=None, parent=None):
+        path = QPainterPath()
+        for il in internal_lines:
+            pts = il.points
+            if len(pts) < 2:
+                continue
+            path.moveTo(QPointF(pts[0][0], pts[0][1]))
+            for x, y in pts[1:]:
+                path.lineTo(QPointF(x, y))
+        super().__init__(path, parent)
+        self._layer = layer
+        self._apply_style()
+
+    def _apply_style(self):
+        color = self._layer.color if self._layer else "#c792ea"
+        lw = self._layer.line_width if self._layer else 1.0
+        dash = self._layer.dash if self._layer else [4, 3]
+        opacity = self._layer.opacity if self._layer else 0.8
+        self.setPen(_make_pen(color, lw, cosmetic=True, dash=dash, opacity=opacity))
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+
+    def update_layer(self, layer):
+        self._layer = layer
+        self._apply_style()
+
+
+# ── LiningItem ────────────────────────────────────────────────────
+
+
+class LiningItem(QGraphicsPathItem):
+    """Lining cut contours (pocket lining, facing) from L8 closed POLYLINE."""
+
+    def __init__(self, lining_contours: list, layer=None, parent=None):
+        path = QPainterPath()
+        for lc in lining_contours:
+            pts = lc.points
+            if len(pts) < 3:
+                continue
+            path.moveTo(QPointF(pts[0][0], pts[0][1]))
+            for x, y in pts[1:]:
+                path.lineTo(QPointF(x, y))
+            path.closeSubpath()
+        super().__init__(path, parent)
+        self._layer = layer
+        self._apply_style()
+
+    def _apply_style(self):
+        color = self._layer.color if self._layer else "#82aaff"
+        lw = self._layer.line_width if self._layer else 1.5
+        dash = self._layer.dash if self._layer else [8, 4]
+        opacity = self._layer.opacity if self._layer else 0.7
+        self.setPen(_make_pen(color, lw, cosmetic=True, dash=dash, opacity=opacity))
+        fill = QColor(color)
+        fill.setAlphaF(opacity * 0.08)
+        self.setBrush(QBrush(fill))
+
+    def update_layer(self, layer):
+        self._layer = layer
+        self._apply_style()
+
+
+# ── DrillItem ─────────────────────────────────────────────────────
+
+
+class DrillItem(QGraphicsItem):
+    """Drill/mark points (pocket corners, button positions) from L13 POINT."""
+
+    CROSS_SIZE: float = 4.0  # mm half-extent
+
+    def __init__(self, drill_points: list, layer=None, parent=None):
+        super().__init__(parent)
+        self._drill_points = drill_points
+        self._layer = layer
+        self._bounds = QRectF()
+        self._build_geometry()
+
+    def _build_geometry(self):
+        if not self._drill_points:
+            self._bounds = QRectF()
+            return
+        xs = [dp.x for dp in self._drill_points]
+        ys = [dp.y for dp in self._drill_points]
+        margin = self.CROSS_SIZE + 2
+        self._bounds = QRectF(
+            min(xs) - margin, min(ys) - margin,
+            (max(xs) - min(xs)) + 2 * margin,
+            (max(ys) - min(ys)) + 2 * margin,
+        )
+
+    def boundingRect(self):
+        return self._bounds
+
+    def paint(self, painter, option, widget=None):
+        color = self._layer.color if self._layer else "#ffcb6b"
+        lw = self._layer.line_width if self._layer else 1.0
+        pen = _make_pen(color, lw, cosmetic=True)
+        painter.setPen(pen)
+        s = self.CROSS_SIZE
+        for dp in self._drill_points:
+            # Draw cross mark
+            painter.drawLine(QPointF(dp.x - s, dp.y), QPointF(dp.x + s, dp.y))
+            painter.drawLine(QPointF(dp.x, dp.y - s), QPointF(dp.x, dp.y + s))
+            # Draw small circle
+            painter.drawEllipse(QPointF(dp.x, dp.y), s * 0.6, s * 0.6)
+
+    def update_layer(self, layer):
+        self._layer = layer
+        self.update()
+
+
+# ── AnnotationItem ────────────────────────────────────────────────
+
+
+class AnnotationItem(QGraphicsItem):
+    """Production annotation text from L8/L15 TEXT — quantity, material notes."""
+
+    def __init__(self, annotations: list, layer=None, parent=None):
+        super().__init__(parent)
+        self._annotations = annotations
+        self._layer = layer
+        self._bounds = QRectF()
+        self._build_geometry()
+
+    def _build_geometry(self):
+        if not self._annotations:
+            self._bounds = QRectF()
+            return
+        xs = [a.x for a in self._annotations]
+        ys = [a.y for a in self._annotations]
+        margin = 20.0
+        self._bounds = QRectF(
+            min(xs) - margin, min(ys) - margin,
+            (max(xs) - min(xs)) + 2 * margin,
+            (max(ys) - min(ys)) + 2 * margin,
+        )
+
+    def boundingRect(self):
+        return self._bounds
+
+    def paint(self, painter, option, widget=None):
+        color = self._layer.color if self._layer else "#c3e88d"
+        painter.setPen(QColor(color))
+        font = QFont("Segoe UI", 8)
+        font.setItalic(True)
+        painter.setFont(font)
+        for a in self._annotations:
+            painter.save()
+            painter.translate(QPointF(a.x, a.y))
+            painter.scale(1, -1)  # un-flip for readable text
+            painter.drawText(QPointF(0, 0), a.text)
+            painter.restore()
+
+    def update_layer(self, layer):
+        self._layer = layer
+        self.update()
 
 
 # ── PieceTextItem ──────────────────────────────────────────────────

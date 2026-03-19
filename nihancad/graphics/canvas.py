@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
 )
 
 from nihancad.graphics.items import (
-    CutlineItem, GrainlineItem, MeasureOverlay, NotchItem,
+    AnnotationItem, CutlineItem, DrillItem, GrainlineItem,
+    InternalLineItem, LiningItem, MeasureOverlay, NotchItem,
     PieceGroup, PieceTextItem, RefLineItem, SeamlineItem, SnapIndicator,
 )
 from nihancad.graphics.layers import LayerManager
@@ -70,6 +71,7 @@ class CADCanvas(QGraphicsView):
     piece_selected = pyqtSignal(int)
     piece_hovered = pyqtSignal(int)
     zoom_changed = pyqtSignal(float)
+    file_dropped = pyqtSignal(str)
 
     # ── Zoom limits ────────────────────────────────────────────────
 
@@ -116,6 +118,7 @@ class CADCanvas(QGraphicsView):
         # ── Appearance ─────────────────────────────────────────────
         self.setBackgroundBrush(QBrush(QColor("#1a1a2e")))
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
 
         # ── Layer manager & grid state ────────────────────────────
         self.layer_manager = LayerManager()
@@ -145,6 +148,10 @@ class CADCanvas(QGraphicsView):
         notch_layer = self.layer_manager.get_layer('notch')
         refline_layer = self.layer_manager.get_layer('refline')
         text_layer = self.layer_manager.get_layer('text')
+        internal_layer = self.layer_manager.get_layer('internal')
+        lining_layer = self.layer_manager.get_layer('lining')
+        drill_layer = self.layer_manager.get_layer('drill')
+        annotation_layer = self.layer_manager.get_layer('annotation')
 
         for piece in pieces:
             group = PieceGroup(piece.id, piece_data=piece)
@@ -172,6 +179,26 @@ class CADCanvas(QGraphicsView):
             # Reference lines
             for rl in piece.ref_lines:
                 item = RefLineItem(rl.x1, rl.y1, rl.x2, rl.y2, layer=refline_layer)
+                group.addToGroup(item)
+
+            # Internal lines (L8 open polylines)
+            if hasattr(piece, 'internal_lines') and piece.internal_lines:
+                item = InternalLineItem(piece.internal_lines, layer=internal_layer)
+                group.addToGroup(item)
+
+            # Lining contours (L8 closed polylines)
+            if hasattr(piece, 'lining_contours') and piece.lining_contours:
+                item = LiningItem(piece.lining_contours, layer=lining_layer)
+                group.addToGroup(item)
+
+            # Drill points (L13)
+            if hasattr(piece, 'drill_points') and piece.drill_points:
+                item = DrillItem(piece.drill_points, layer=drill_layer)
+                group.addToGroup(item)
+
+            # Annotations (L8+L15 text)
+            if hasattr(piece, 'annotations') and piece.annotations:
+                item = AnnotationItem(piece.annotations, layer=annotation_layer)
                 group.addToGroup(item)
 
             self.scene().addItem(group)
@@ -251,6 +278,14 @@ class CADCanvas(QGraphicsView):
                     layer_id = 'notch'
                 elif isinstance(child, RefLineItem):
                     layer_id = 'refline'
+                elif isinstance(child, InternalLineItem):
+                    layer_id = 'internal'
+                elif isinstance(child, LiningItem):
+                    layer_id = 'lining'
+                elif isinstance(child, DrillItem):
+                    layer_id = 'drill'
+                elif isinstance(child, AnnotationItem):
+                    layer_id = 'annotation'
                 if layer_id:
                     layer = self.layer_manager.get_layer(layer_id)
                     if layer:
@@ -449,6 +484,58 @@ class CADCanvas(QGraphicsView):
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
         painter.restore()
+
+        # Welcome overlay when empty
+        if not self._piece_groups:
+            self._draw_welcome(painter)
+
+    def _draw_welcome(self, painter: QPainter) -> None:
+        """Draw a welcome message when no pieces are loaded."""
+        painter.save()
+        painter.resetTransform()
+        vw = self.viewport().width()
+        vh = self.viewport().height()
+
+        # Title
+        font = QFont("Segoe UI", 22)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#8b8fa8"))
+        painter.drawText(QRectF(0, vh / 2 - 60, vw, 40), Qt.AlignmentFlag.AlignCenter, "NihanCAD")
+
+        # Subtitle
+        font2 = QFont("Segoe UI", 12)
+        painter.setFont(font2)
+        painter.setPen(QColor("#6c7086"))
+        painter.drawText(
+            QRectF(0, vh / 2 - 15, vw, 30),
+            Qt.AlignmentFlag.AlignCenter,
+            "DXF / GEM dosyasini surukleyin veya Ctrl+O ile acin",
+        )
+
+        painter.restore()
+
+    # ── Drag & drop ────────────────────────────────────────────────
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path.lower().endswith(('.dxf', '.gem', '.gemx')):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(('.dxf', '.gem', '.gemx')):
+                self.file_dropped.emit(path)
+                event.acceptProposedAction()
+                return
 
     # ── Mouse events ───────────────────────────────────────────────
 
