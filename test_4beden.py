@@ -13,7 +13,7 @@ from algorithms import ga_sa_hybrid
 # GPU decoder varsa kullan
 try:
     import torch
-    from gpu_decoder import GPUDecoder
+    from gpu_decoder_v3 import GPUDecoderV3 as GPUDecoder
     HAS_GPU = torch.cuda.is_available()
     if HAS_GPU:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
